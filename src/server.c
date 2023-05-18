@@ -50,6 +50,9 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
+#include <fcntl.h>
+#include <linux/vm_sockets.h>
+
 #ifdef ENABLE_TLS
 #include <gnutls/gnutls.h>
 #endif
@@ -1219,7 +1222,10 @@ static void record_peer_hostname(int fd, struct nvnc_client* client)
 		if (peer->sa_family == AF_UNIX) {
 			snprintf(client->hostname, sizeof(client->hostname),
 					"unix domain socket");
-		} else {
+		} else if (peer->sa_family == AF_VSOCK) {
+            snprintf(client->hostname, sizeof(client->hostname),
+                    "vsock socket");
+        } else {
 			getnameinfo(peer, peerlen,
 					client->hostname, sizeof(client->hostname),
 					NULL, 0, // no need for port
@@ -1396,6 +1402,90 @@ static int bind_address_unix(const char* name)
 	return fd;
 }
 
+// TODO: Optimize function
+static int vsock_parse_cid(const char *name)
+{
+    long cid = -1;
+    char *end = NULL;
+
+    cid = strtol(name, &end, 10);
+    if (end != name + strlen(name)) {
+        return -EINVAL;
+    }
+ 
+    return cid;
+}
+
+/*
+ * Try to validate the given address.
+ * The address must not be null and must have the correct address family.
+ * Any reserved fields must be zero.
+ *
+ * Returns: 
+ *  0 on success,
+ *  EFAULT if the address is null,
+ *  EAFNOSUPPORT if the address is of the wrong family,
+ *  EINVAL if the reserved fields are not zero.
+ */
+static int vsock_addr_validate(const struct sockaddr_vm *addr)
+{
+    if (!addr)
+        return -EFAULT;
+
+    if (addr->svm_family != AF_VSOCK)
+        return -EAFNOSUPPORT;
+
+    if (addr->svm_zero[0] != 0)
+        return -EINVAL;
+
+    return 0;
+}
+
+static int bind_address_vsock(const char* name, uint16_t port)
+{
+    // TODO: Is this really needed?
+    if (port == NULL) {
+        port = 5900;
+    }
+   
+    nvnc_log(NVNC_LOG_DEBUG, "Binding to VSOCK address: %s", name);
+
+    // Parse CID
+    int cid = -1;
+    cid = vsock_parse_cid(name);
+    if (cid < 0) {
+        nvnc_log(NVNC_LOG_DEBUG, "Binding to VMADDR_CID_ANY, invalid CID: %s", name);
+        cid = VMADDR_CID_ANY;
+    }
+
+    // Prepare sockaddr_vm structure
+    struct sockaddr_vm addr;
+    memset(&addr, 0, sizeof addr);
+    addr.svm_family = AF_VSOCK;
+    addr.svm_cid = cid;
+    addr.svm_port = port;
+    
+    if (vsock_addr_validate(&addr) != 0) {
+        nvnc_log(NVNC_LOG_ERROR, "Invalid AF_VSOCK address");
+        return -1;
+    }
+
+    // Create socket and bind connection
+    int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		nvnc_log(NVNC_LOG_ERROR, "Failed to create AF_VSOCK socket");
+        return -1;
+    }
+
+	if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+		nvnc_log(NVNC_LOG_ERROR, "Failed to bind AF_VSOCK socket");
+        close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
 static int bind_address(const char* name, uint16_t port,
 		enum nvnc__socket_type type)
 {
@@ -1405,6 +1495,8 @@ static int bind_address(const char* name, uint16_t port,
 		return bind_address_tcp(name, port);
 	case NVNC__SOCKET_UNIX:
 		return bind_address_unix(name);
+    case NVNC__SOCKET_VSOCK:
+        return bind_address_vsock(name, port);
 	}
 
 	nvnc_log(NVNC_LOG_PANIC, "Unknown socket address type");
@@ -1478,6 +1570,12 @@ EXPORT
 struct nvnc* nvnc_open_unix(const char* address)
 {
 	return open_common(address, 0, NVNC__SOCKET_UNIX);
+}
+
+EXPORT
+struct nvnc* nvnc_open_vsock(const char* address, uint16_t port)
+{
+	return open_common(address, port, NVNC__SOCKET_VSOCK);
 }
 
 static void unlink_fd_path(int fd)
